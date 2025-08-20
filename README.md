@@ -28,3 +28,10 @@ A simple master microphone muting/unmuting app which supports custom keybinds an
 
 
 > Note: I made this app for a friend to solve a problem, but anyone can now use it :)
+
+---
+# Important 
+
+The mic tray icon will **not sync** with any external meeting app / any in-game multiplayer microphone state. This app is a master control on the device's microphone passthrough, so only pressing the correct key combo will reflect on the system tray and the microphone will be blocked, blocking input audio to any and all apps using the specific device. For example pressing mute on google meet, zoom or discord will make this app mute it's mic, or pressing the key combo will not make these apps press their mute buttons those are governed by the respective apps. 
+
+TLDR: **This app acts independently of any and all multiplayer games / video conference /  call apps so those apps will not affect this app's mic state, but this app will affect the mic of all the other apps using the selected device.**
