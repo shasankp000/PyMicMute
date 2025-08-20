@@ -13,10 +13,11 @@ A simple master microphone muting/unmuting app which supports custom keybinds an
 
 <img width="420" height="607" alt="image" src="https://github.com/user-attachments/assets/1808eddf-c1e0-4512-b8c1-556d366178f7" />
 
-5. Click on Rebind Hotkey -> press whatever key combo / single button you feel like.
-6. If you want to make sure the app starts on startup, click on the Run at startup option
-7. Set the theme as per choices.
-8. You can check mic mute/unmute settings by clicking on the Toggle Mic button or pressing the keybind
+5. From the dropdown menu, select the input device of your choice.
+6. Click on Rebind Hotkey -> press whatever key combo / single button you feel like.
+7. If you want to make sure the app starts on startup, click on the Run at startup option
+8. Set the theme as per choices.
+9. You can check mic mute/unmute settings by clicking on the Toggle Mic button or pressing the keybind
 
 # Features
 
