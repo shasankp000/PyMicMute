@@ -23,7 +23,7 @@ A simple master microphone muting/unmuting app which supports custom keybinds an
 
 1. Simple to use
 2. Cool UI (for a python app that is)
-3. App has a resilient settings feature which works against input device crashes or power cuts, after such an event when the app is reboot or the input device is re-connected, the app will remember what state the mic was in previously and automatically mute or un-mute the mirophone.
+3. App has a resilient settings feature which works against input device crashes or power cuts, after such an event when the app is restarted or the input device is re-connected, the app will remember what state the mic was in previously and automatically mute or un-mute the mirophone.
 4. Works across any meeting app/multiplayer game that uses a mic.
 
 
