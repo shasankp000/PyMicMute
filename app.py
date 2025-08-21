@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import threading
+import time
 import traceback
 import atexit
 from pathlib import Path
@@ -22,7 +23,7 @@ import customtkinter as ctk
 import keyboard
 import pystray
 from PIL import Image
-from ctypes import POINTER, cast, c_void_p, c_int, c_ulong, c_wchar_p, windll
+from ctypes import POINTER, cast, c_void_p, c_int, c_ulong, c_wchar_p, windll, byref
 from ctypes import wintypes
 from comtypes import CLSCTX_ALL, GUID, HRESULT, IUnknown
 from comtypes import CoCreateInstance
@@ -228,8 +229,11 @@ def set_muted(m):
             pass
 
 def toggle_mic():
-    if AUDIO_VOL:
-        set_muted(not is_muted())
+    current = is_muted()
+    if current is None:
+        # No devices found; do nothing
+        return
+    set_muted(0 if current else 1)
 
 # ------------- Autostart (Startup Shortcut) -------------
 def startup_dir():
@@ -297,6 +301,13 @@ tray = None
 hotkey_handle = None
 SHUTDOWN_EVENT = threading.Event()
 SINGLETON_HANDLE = None
+WINAPI_HOTKEY_THREAD = None
+WINAPI_HOTKEY_STOP = None
+WINAPI_HOTKEY_ID = 1
+LAST_TOGGLE_TS = 0.0
+DEBOUNCE_SEC = 0.2
+STATUS_LISTENERS = []  # callables notified after status change
+HOTKEY_LOCK = threading.Lock()
 
 def ensure_single_instance():
     # Named mutex to prevent multiple instances
@@ -341,10 +352,58 @@ def update_tray_icon():
     except Exception as e:
         print("Tray update failed:", e, file=sys.stderr)
 
+def notify_status_changed():
+    # Called after mute status changes to update any open windows
+    for cb in list(STATUS_LISTENERS):
+        try:
+            # If the listener has a Tk window attribute, marshal to UI thread
+            try:
+                win = getattr(cb, "__tk_window__", None)
+                if win is not None and hasattr(win, "after"):
+                    win.after(0, cb)
+                else:
+                    cb()
+            except Exception:
+                cb()
+        except Exception:
+            pass
+
+def suspend_hotkeys():
+    """Temporarily disable both keyboard and WinAPI hotkeys (used during rebind)."""
+    global hotkey_handle, WINAPI_HOTKEY_THREAD, WINAPI_HOTKEY_STOP
+    try:
+        if hotkey_handle:
+            keyboard.remove_hotkey(hotkey_handle)
+            hotkey_handle = None
+    except Exception:
+        pass
+    try:
+        if WINAPI_HOTKEY_THREAD and WINAPI_HOTKEY_THREAD.is_alive():
+            if WINAPI_HOTKEY_STOP:
+                WINAPI_HOTKEY_STOP.set()
+            WINAPI_HOTKEY_THREAD.join(timeout=0.5)
+    except Exception:
+        pass
+
+def resume_hotkeys(combo):
+    """Re-register hotkeys with the given combo."""
+    try:
+        register_hotkey(combo)
+    except Exception:
+        pass
+
 def on_quit(icon, item):
     try:
         if hotkey_handle:
             keyboard.remove_hotkey(hotkey_handle)
+    except Exception:
+        pass
+    # Stop WinAPI hotkey if running
+    try:
+        if WINAPI_HOTKEY_THREAD and WINAPI_HOTKEY_THREAD.is_alive():
+            if WINAPI_HOTKEY_STOP:
+                WINAPI_HOTKEY_STOP.set()
+            WINAPI_HOTKEY_THREAD.join(timeout=0.5)
     except Exception:
         pass
     try:
@@ -364,16 +423,160 @@ def tray_thread():
     tray.run()
 
 # ------------- Hotkey Registration -------------
+def _on_hotkey_event():
+    print("Detected hotkey")
+    global LAST_TOGGLE_TS
+    with HOTKEY_LOCK:
+        now = time.time()
+        if now - LAST_TOGGLE_TS < DEBOUNCE_SEC:
+            return
+        LAST_TOGGLE_TS = now
+    try:
+        toggle_mic()
+        update_tray_icon()
+        notify_status_changed()
+    except Exception:
+        print("Exception detected.")
+        pass
+
+def _ensure_winapi_hotkey(hotkey):
+    """Register or re-register a WinAPI global hotkey in a dedicated thread."""
+    global WINAPI_HOTKEY_THREAD, WINAPI_HOTKEY_STOP
+    try:
+        mods_vk = parse_hotkey(hotkey)
+        if not mods_vk:
+            return False
+        mods, vk = mods_vk
+
+        # Stop previous thread cleanly
+        try:
+            if WINAPI_HOTKEY_THREAD and WINAPI_HOTKEY_THREAD.is_alive():
+                if WINAPI_HOTKEY_STOP:
+                    WINAPI_HOTKEY_STOP.set()
+                WINAPI_HOTKEY_THREAD.join(timeout=0.5)
+        except Exception:
+            pass
+
+        stop_event = threading.Event()
+        def hotkey_loop():
+            # Initialize COM on this thread for Core Audio operations
+            try:
+                windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+            except Exception:
+                pass
+            # Register in this thread so WM_HOTKEY is delivered here
+            if not windll.user32.RegisterHotKey(None, WINAPI_HOTKEY_ID, mods, vk):
+                return
+            msg = wintypes.MSG()
+            PM_REMOVE = 0x0001
+            try:
+                while not stop_event.is_set() and not SHUTDOWN_EVENT.is_set():
+                    if windll.user32.PeekMessageW(byref(msg), None, 0, 0, PM_REMOVE):
+                        if msg.message == 0x0312:  # WM_HOTKEY
+                            _on_hotkey_event()
+                        windll.user32.TranslateMessage(byref(msg))
+                        windll.user32.DispatchMessageW(byref(msg))
+                    else:
+                        time.sleep(0.02)
+            finally:
+                try:
+                    windll.user32.UnregisterHotKey(None, WINAPI_HOTKEY_ID)
+                except Exception:
+                    pass
+                try:
+                    windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=hotkey_loop, daemon=True)
+        t.start()
+        WINAPI_HOTKEY_THREAD = t
+        WINAPI_HOTKEY_STOP = stop_event
+        return True
+    except Exception:
+        return False
+
 def register_hotkey(hotkey):
+    """Prefer WinAPI global hotkey; fall back to keyboard hook if WinAPI fails."""
     global hotkey_handle
+    ok_win = _ensure_winapi_hotkey(hotkey)
+    if ok_win:
+        # Ensure only WinAPI handler is active to avoid duplicate events
+        try:
+            if hotkey_handle:
+                keyboard.remove_hotkey(hotkey_handle)
+                hotkey_handle = None
+        except Exception:
+            pass
+        return True
+    # Fallback: keyboard library
     try:
         if hotkey_handle:
             keyboard.remove_hotkey(hotkey_handle)
-        hotkey_handle = keyboard.add_hotkey(hotkey, lambda: (toggle_mic(), update_tray_icon()))
+            hotkey_handle = None
+        hotkey_handle = keyboard.add_hotkey(hotkey, _on_hotkey_event)
         return True
-    except Exception as e:
-        print("Hotkey registration failed:", e, file=sys.stderr)
+    except Exception:
+        try:
+            if Notification is not None:
+                Notification(app_id="MicMuteApp", title="Hotkey", msg="Failed to register hotkey", icon=str(ICON_DIR / "mic.ico")).show()
+        except Exception:
+            pass
         return False
+
+def parse_hotkey(hotkey_str):
+    # Convert 'ctrl+alt+m' to (mods, vk)
+    if not isinstance(hotkey_str, str):
+        return None
+    parts = [p.strip().lower() for p in hotkey_str.replace(' ', '').split('+') if p]
+    if not parts:
+        return None
+    MOD_ALT=0x0001; MOD_CONTROL=0x0002; MOD_SHIFT=0x0004; MOD_WIN=0x0008
+    mods=0; key=None
+    for p in parts:
+        if p in ('ctrl','control','ctl'): mods|=MOD_CONTROL; continue
+        if p in ('alt','menu'): mods|=MOD_ALT; continue
+        if p in ('shift',): mods|=MOD_SHIFT; continue
+        if p in ('win','super','meta'): mods|=MOD_WIN; continue
+        key = p
+    if not key:
+        return None
+    # Map key to virtual-key
+    vk = map_key_to_vk(key)
+    if vk is None:
+        return None
+    return mods, vk
+
+def map_key_to_vk(key):
+    key = key.lower()
+    # Function keys
+    if key.startswith('f') and key[1:].isdigit():
+        n=int(key[1:])
+        if 1<=n<=24:
+            return 0x70 + (n-1)
+    special = {
+        'space':0x20,'tab':0x09,'enter':0x0D,'return':0x0D,'escape':0x1B,'esc':0x1B,
+        'left':0x25,'up':0x26,'right':0x27,'down':0x28,
+        'home':0x24,'end':0x23,'pageup':0x21,'pagedown':0x22,
+        'insert':0x2D,'delete':0x2E,'backspace':0x08,
+        'apps':0x5D,'printscreen':0x2C,'scrolllock':0x91,'pause':0x13,
+    }
+    if key in special:
+        return special[key]
+    # Letters/digits
+    if len(key)==1:
+        ch = key.upper()
+        code = ord(ch)
+        if 'A'<=ch<='Z' or '0'<=ch<='9':
+            return code
+    # Try VkKeyScanW
+    try:
+        res = windll.user32.VkKeyScanW(ord(key[0]))
+        if res != -1:
+            return res & 0xFF
+    except Exception:
+        pass
+    return None
 
 # ------------- GUI (customtkinter) -------------
 def open_settings_window():
@@ -473,18 +676,78 @@ def open_settings_window():
     hotkey_label.pack(pady=(14, 6))
 
     def rebind_hotkey():
+        # Non-blocking popup capture using Tk key events
         hotkey_label.configure(text="Press new hotkey... (Esc to cancel)")
+        suspend_hotkeys()
+
+        popup = ctk.CTkToplevel(win)
+        popup.title("Set Hotkey")
         try:
-            combo = keyboard.read_hotkey(suppress=False)  # allow Esc to cancel
+            popup.iconbitmap(str(ICON_DIR / "mic.ico"))
+        except Exception:
+            pass
+        popup.geometry("300x120")
+        try:
+            popup.attributes("-topmost", True)
+        except Exception:
+            pass
+        popup.grab_set()
+        popup.focus_force()
+        info = ctk.CTkLabel(popup, text="Press keys now...\n(Use Ctrl/Alt/Shift/Win + key)")
+        info.pack(pady=10)
+
+        current_mods = {"ctrl": False, "alt": False, "shift": False, "win": False}
+        final_combo = {"text": None}
+
+        def format_combo(mods, key):
+            parts = []
+            if mods["ctrl"]: parts.append("ctrl")
+            if mods["alt"]: parts.append("alt")
+            if mods["shift"]: parts.append("shift")
+            if mods["win"]: parts.append("win")
+            if key: parts.append(key)
+            return "+".join(parts) if parts else ""
+
+        def on_key_press(event):
+            k = (event.keysym or "").lower()
+            if k in ("control_l","control_r","control"): current_mods["ctrl"] = True; return
+            if k in ("alt_l","alt_r","menu","alt"): current_mods["alt"] = True; return
+            if k in ("shift_l","shift_r","shift"): current_mods["shift"] = True; return
+            if k in ("super_l","super_r","meta_l","meta_r","win"): current_mods["win"] = True; return
+            if k == "escape":
+                popup.destroy()
+                resume_hotkeys(CONFIG["hotkey"])
+                hotkey_label.configure(text=f"Hotkey: {CONFIG['hotkey']}")
+                return
+            # Treat other keys as the trigger key
+            combo = format_combo(current_mods, k)
             if combo:
+                final_combo["text"] = combo
+                popup.destroy()
                 if register_hotkey(combo):
                     CONFIG["hotkey"] = combo
                     save_config(CONFIG)
                     hotkey_label.configure(text=f"Hotkey: {combo}")
-        except Exception:
-            traceback.print_exc()
-        finally:
-            refresh_status()
+                else:
+                    resume_hotkeys(CONFIG["hotkey"])
+                    hotkey_label.configure(text=f"Hotkey: {CONFIG['hotkey']} (failed)")
+
+        def on_key_release(event):
+            k = (event.keysym or "").lower()
+            if k in ("control_l","control_r","control"): current_mods["ctrl"] = False
+            if k in ("alt_l","alt_r","menu","alt"): current_mods["alt"] = False
+            if k in ("shift_l","shift_r","shift"): current_mods["shift"] = False
+            if k in ("super_l","super_r","meta_l","meta_r","win"): current_mods["win"] = False
+
+        popup.bind("<KeyPress>", on_key_press)
+        popup.bind("<KeyRelease>", on_key_release)
+        popup.transient(win)
+        # Block only this handler until the popup closes; main UI stays responsive
+        popup.wait_window(popup)
+        # Safety: if no combo selected, resume old
+        if not final_combo["text"]:
+            resume_hotkeys(CONFIG["hotkey"])
+        refresh_status()
 
     rebind_btn = ctk.CTkButton(scroll, text="Rebind Hotkey", command=rebind_hotkey)
     rebind_btn.pack(pady=6)
@@ -515,11 +778,36 @@ def open_settings_window():
     ctk.CTkButton(appearance_frame, text="Dark", width=64, command=lambda: set_appearance("dark")).pack(side="left", padx=4)
     ctk.CTkButton(appearance_frame, text="System", width=64, command=lambda: set_appearance("system")).pack(side="left", padx=4)
 
+    # Ensure this window updates when hotkey toggles
+    def _listener():
+        try:
+            if win.winfo_exists():
+                m = is_muted()
+                status.configure(text=f"Mic: {'MUTED' if m else 'ON'}", text_color=("red" if m else "green"))
+        except Exception:
+            pass
+    # Attach the window so updates can be marshaled to UI thread
+    _listener.__tk_window__ = win
+    STATUS_LISTENERS.append(_listener)
+
+    def _on_close():
+        try:
+            if _listener in STATUS_LISTENERS:
+                STATUS_LISTENERS.remove(_listener)
+        except Exception:
+            pass
+        win.destroy()
+
     # Close btn
-    close_btn = ctk.CTkButton(scroll, text="Close", fg_color="#444", hover_color="#333", command=win.destroy)
+    close_btn = ctk.CTkButton(scroll, text="Close", fg_color="#444", hover_color="#333", command=_on_close)
     close_btn.pack(pady=8)
 
     refresh_status()
+    # Also handle window close button (X)
+    try:
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+    except Exception:
+        pass
     win.mainloop()
 
 
