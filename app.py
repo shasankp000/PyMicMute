@@ -182,18 +182,38 @@ def resolve_mic_endpoint():
 MIC_DEVICE = resolve_mic_endpoint()
 AUDIO_VOL = activate_endpoint_volume(MIC_DEVICE) if MIC_DEVICE else None
 
+def iter_capture_volumes():
+    for dev, _name, _id in list_input_devices():
+        try:
+            yield activate_endpoint_volume(dev)
+        except Exception:
+            continue
+
 def is_muted():
-    if AUDIO_VOL:
-        return AUDIO_VOL.GetMute()
-    return None
+    # Consider mic muted only if all active capture endpoints are muted
+    states = []
+    for vol in iter_capture_volumes():
+        try:
+            states.append(vol.GetMute())
+        except Exception:
+            continue
+    if not states:
+        return None
+    return 1 if all(s == 1 for s in states) else 0
 
 def set_muted(m):
-    if AUDIO_VOL:
-        AUDIO_VOL.SetMute(1 if m else 0, None)
+    changed = False
+    for vol in iter_capture_volumes():
+        try:
+            vol.SetMute(1 if m else 0, None)
+            changed = True
+        except Exception:
+            continue
+    if changed:
         # persist last known state
         CONFIG["last_muted"] = bool(m)
         save_config(CONFIG)
-        # toast notification
+        # toast notification (single)
         try:
             if Notification is not None:
                 icon_path = str(ICON_DIR / ("mic_off.ico" if m else "mic_on.ico"))
